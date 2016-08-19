@@ -1,0 +1,667 @@
+diff --git a/trove/common/cfg.py b/trove/common/cfg.py
+index 62d4124..8303398 100644
+--- a/trove/common/cfg.py
++++ b/trove/common/cfg.py
+@@ -414,6 +414,75 @@ database_opts = [
+                 default=False,
+                 deprecated_name='sql_query_log',
+                 deprecated_group='DEFAULT'),
++    cfg.StrOpt('mysql_sql_mode',
++               default='TRADITIONAL',
++               help='The SQL mode to be used for MySQL sessions. '
++                    'This option, including the default, overrides any '
++                    'server-set SQL mode. To use whatever SQL mode '
++                    'is set by the server configuration, '
++                    'set this to no value. Example: mysql_sql_mode='),
++    cfg.IntOpt('min_pool_size',
++               default=1,
++               deprecated_opts=[cfg.DeprecatedOpt('sql_min_pool_size',
++                                                  group='DEFAULT'),
++                                cfg.DeprecatedOpt('sql_min_pool_size',
++                                                  group='DATABASE')],
++               help='Minimum number of SQL connections to keep open in a '
++                    'pool.'),
++    cfg.IntOpt('max_pool_size',
++               deprecated_opts=[cfg.DeprecatedOpt('sql_max_pool_size',
++                                                  group='DEFAULT'),
++                                cfg.DeprecatedOpt('sql_max_pool_size',
++                                                  group='DATABASE')],
++               help='Maximum number of SQL connections to keep open in a '
++                    'pool.'),
++    cfg.IntOpt('max_retries',
++               default=10,
++               deprecated_opts=[cfg.DeprecatedOpt('sql_max_retries',
++                                                  group='DEFAULT'),
++                                cfg.DeprecatedOpt('sql_max_retries',
++                                                  group='DATABASE')],
++               help='Maximum number of database connection retries '
++                    'during startup. Set to -1 to specify an infinite '
++                    'retry count.'),
++    cfg.IntOpt('retry_interval',
++               default=10,
++               deprecated_opts=[cfg.DeprecatedOpt('sql_retry_interval',
++                                                  group='DEFAULT'),
++                                cfg.DeprecatedOpt('reconnect_interval',
++                                                  group='DATABASE')],
++               help='Interval between retries of opening a SQL connection.'),
++    cfg.IntOpt('max_overflow',
++               default=50,
++               deprecated_opts=[cfg.DeprecatedOpt('sql_max_overflow',
++                                                  group='DEFAULT'),
++                                cfg.DeprecatedOpt('sqlalchemy_max_overflow',
++                                                  group='DATABASE')],
++               help='If set, use this value for max_overflow with '
++                    'SQLAlchemy.'),
++    cfg.BoolOpt('use_db_reconnect',
++                default=False,
++                help='Enable the experimental use of database reconnect '
++                     'on connection lost.'),
++    cfg.IntOpt('db_retry_interval',
++               default=1,
++               help='Seconds between retries of a database transaction.'),
++    cfg.BoolOpt('db_inc_retry_interval',
++                default=True,
++                help='If True, increases the interval between retries '
++                     'of a database operation up to db_max_retry_interval.'),
++    cfg.IntOpt('db_max_retry_interval',
++               default=10,
++               help='If db_inc_retry_interval is set, the '
++                    'maximum seconds between retries of a '
++                    'database operation.'),
++    cfg.IntOpt('db_max_retries',
++               default=20,
++               help='Maximum retries in case of connection error or deadlock '
++                    'error before error is '
++                    'raised. Set to -1 to specify an infinite retry '
++                    'count.'),
++
+ ]
+ 
+ 
+diff --git a/trove/db/models.py b/trove/db/models.py
+index e25a94b..abb877a 100644
+--- a/trove/db/models.py
++++ b/trove/db/models.py
+@@ -127,6 +127,7 @@ class DatabaseModelBase(models.ModelBase):
+     @classmethod
+     def find_by_pagination(cls, collection_type, collection_query,
+                            paginated_url, **kwargs):
++	LOG.debug('XXXXXXXXXX paginated_collection %s' % kwargs)
+         elements, next_marker = collection_query.paginated_collection(**kwargs)
+ 
+         return pagination.PaginatedDataView(collection_type,
+diff --git a/trove/db/sqlalchemy/migrate_repo/manage.py b/trove/db/sqlalchemy/migrate_repo/manage.py
+index 0ed0863..ffec632 100644
+--- a/trove/db/sqlalchemy/migrate_repo/manage.py
++++ b/trove/db/sqlalchemy/migrate_repo/manage.py
+@@ -1,4 +1,3 @@
+-#!/usr/bin/env python
+ 
+ # Copyright 2011 OpenStack Foundation
+ # All Rights Reserved.
+diff --git a/trove/db/sqlalchemy/session.py b/trove/db/sqlalchemy/session.py
+index 6d8fcc5..649b3e3 100644
+--- a/trove/db/sqlalchemy/session.py
++++ b/trove/db/sqlalchemy/session.py
+@@ -14,11 +14,17 @@
+ #    under the License.
+ 
+ import contextlib
++import functools
++import datetime
++import time
+ import osprofiler.sqlalchemy
+ import sqlalchemy
+ from sqlalchemy import create_engine
+ from sqlalchemy import MetaData
+-from sqlalchemy.orm import sessionmaker
++# from sqlalchemy.orm import sessionmaker
++from sqlalchemy.sql.expression import literal_column
++from sqlalchemy.sql.expression import select
++from sqlalchemy import exc as sqla_exc
+ 
+ from trove.common import cfg
+ from trove.openstack.common import log as logging
+@@ -34,6 +40,36 @@ LOG = logging.getLogger(__name__)
+ CONF = cfg.CONF
+ 
+ 
++def utcnow():
++    ts = time.time()
++    return datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S')
++
++
++class Session(sqlalchemy.orm.session.Session):
++    """Custom Session class to avoid SqlAlchemy Session monkey patching."""
++
++
++class Query(sqlalchemy.orm.query.Query):
++    """Subclass of sqlalchemy.query with soft_delete() method."""
++    def soft_delete(self, synchronize_session='evaluate'):
++        return self.update({'deleted': literal_column('id'),
++                            'updated_at': literal_column('updated_at'),
++                            'deleted_at': utcnow()},
++                           synchronize_session=synchronize_session)
++
++
++def _is_db_connection_error(args):
++    """Return True if error in connecting to db."""
++    # NOTE(adam_g): This is currently MySQL specific and needs to be extended
++    #               to support Postgres and others.
++    # For the db2, the error code is -30081 since the db2 is still not ready
++    conn_err_codes = ('2002', '2003', '2006', '2013', '-30081')
++    for err_code in conn_err_codes:
++        if args.find(err_code) != -1:
++            return True
++    return False
++
++
+ def configure_db(options, models_mapper=None):
+     global _ENGINE
+     if not _ENGINE:
+@@ -73,18 +109,177 @@ def configure_db(options, models_mapper=None):
+         mappers.map(_ENGINE, models)
+ 
+ 
++def _thread_yield(dbapi_con, con_record):
++    """Ensure other greenthreads get a chance to be executed.
++
++    If we use eventlet.monkey_patch(), eventlet.greenthread.sleep(0) will
++    execute instead of time.sleep(0).
++    Force a context switch. With common database backends (eg MySQLdb and
++    sqlite), there is no implicit yield caused by network I/O since they are
++    implemented by C libraries that eventlet cannot monkey patch.
++    """
++    time.sleep(0)
++
++
++def _ping_listener(engine, dbapi_conn, connection_rec, connection_proxy):
++    """Ensures that MySQL connections are alive.
++    """
++    # cursor = dbapi_conn.cursor()
++    save_should_close_with_result = connection.should_close_with_result
++    connection.should_close_with_result = Fals
++    try:
++        # ping_sql = 'select 1'
++        # cursor.execute(ping_sql)
++        dbapi_conn.scalar(select([1]))
++    except Exception as ex:
++        if engine.dialect.is_disconnect(ex, dbapi_conn, cursor):
++            msg = 'Database server has gone away: %s' % ex
++            LOG.warning(msg)
++            # if the database server has gone away, all connections in the pool
++            # have become invalid and we can safely close all of them here,
++            # rather than waste time on checking of every single connection
++            engine.dispose()
++
++            # this will be handled by SQLAlchemy and will force it to create
++            # a new connection and retry the original action
++            raise sqla_exc.DisconnectionError(msg)
++        else:
++            raise
++
++def _connect_ping_listener(connection, branch):
++    """Ping the server at connection startup.
++    """
++    if branch:
++        return
++
++    save_should_close_with_result = connection.should_close_with_result
++    connection.should_close_with_result = False
++    try:
++        connection.scalar(select([1]))
++    except Exception as ex:
++        connection.scalar(select([1]))
++    finally:
++        connection.should_close_with_result = save_should_close_with_result
++
++
++
++def _set_session_sql_mode(dbapi_con, connection_rec, sql_mode=None):
++    """Set the sql_mode session variable.
++
++    MySQL supports several server modes. The default is None, but sessions
++    may choose to enable server modes like TRADITIONAL, ANSI,
++    several STRICT_* modes and others.
++
++    Note: passing in '' (empty string) for sql_mode clears
++    the SQL mode for the session, overriding a potentially set
++    server default.
++    """
++
++    cursor = dbapi_con.cursor()
++    cursor.execute("SET SESSION sql_mode = %s", [sql_mode])
++
++
++def _mysql_get_effective_sql_mode(engine):
++    """Returns the effective SQL mode for connections from the engine pool.
++
++    Returns ``None`` if the mode isn't available, otherwise returns the mode.
++
++    """
++    # Get the real effective SQL mode. Even when unset by
++    # our own config, the server may still be operating in a specific
++    # SQL mode as set by the server configuration.
++    # Also note that the checkout listener will be called on execute to
++    # set the mode if it's registered.
++    row = engine.execute("SHOW VARIABLES LIKE 'sql_mode'").fetchone()
++    if row is None:
++        return
++    return row[1]
++
++
++def _mysql_check_effective_sql_mode(engine):
++    """Logs a message based on the effective SQL mode for MySQL connections."""
++    realmode = _mysql_get_effective_sql_mode(engine)
++
++    if realmode is None:
++        LOG.warning(_LW('Unable to detect effective SQL mode'))
++        return
++
++    LOG.debug('MySQL server mode set to %s', realmode)
++
++    # 'TRADITIONAL' mode enables several other modes, so
++    # we need a substring match here
++    if not ('TRADITIONAL' in realmode.upper() or
++            'STRICT_ALL_TABLES' in realmode.upper()):
++        LOG.warning("MySQL SQL mode is %s" % realmode)
++
++
++def _mysql_set_mode_callback(engine, sql_mode):
++    if sql_mode is not None:
++        mode_callback = functools.partial(_set_session_sql_mode,
++                                          sql_mode=sql_mode)
++        sqlalchemy.event.listen(engine, 'connect', mode_callback)
++    _mysql_check_effective_sql_mode(engine)
++
++
+ def _create_engine(options):
+     engine_args = {
+-        "pool_recycle": CONF.database.idle_timeout,
+-        "echo": CONF.database.query_log
++        'pool_recycle': CONF.database.idle_timeout,
++        'encoding': 'utf8',
++        'pool_size': 64,
++        'convert_unicode': True,
+     }
++
++    mysql_sql_mode = CONF.database.mysql_sql_mode
++    retry_interval = CONF.database.retry_interval
+     LOG.info(_("Creating SQLAlchemy engine with args: %s") % engine_args)
+-    db_engine = create_engine(options['database']['connection'], **engine_args)
+-    if CONF.profiler.enabled and CONF.profiler.trace_sqlalchemy:
+-        osprofiler.sqlalchemy.add_tracing(sqlalchemy, db_engine, "db")
++
++    sql_connection = options['database']['connection']
++    db_engine = create_engine(sql_connection, **engine_args)
++
++    sqlalchemy.event.listen(db_engine, "engine_connect", _connect_ping_listener)
++    sqlalchemy.event.listen(db_engine, 'checkin', _thread_yield)
++    if db_engine.name in ('mysql'):
++        # ping_callback = functools.partial(_ping_listener, db_engine)
++        # sqlalchemy.event.listen(db_engine, 'checkout', ping_callback)
++        if mysql_sql_mode:
++            _mysql_set_mode_callback(db_engine, mysql_sql_mode)
++    try:
++        db_engine.connect()
++    except sqla_exc.OperationalError as e:
++        if not _is_db_connection_error(e.args[0]):
++            raise
++
++        remaining = CONF.database.max_retries
++        if remaining == -1:
++            remaining = 'infinite'
++        while True:
++            msg = "SQL connection failed. %s attempts left."
++            print msg % remaining
++            # LOG.warning(msg % remaining)
++            if remaining != 'infinite':
++                remaining -= 1
++            time.sleep(retry_interval)
++            try:
++                db_engine.connect()
++                break
++            except sqla_exc.OperationalError as e:
++                if (remaining != 'infinite' and remaining == 0) or \
++                        not _is_db_connection_error(e.args[0]):
++                    raise
++    # if CONF.profiler.enabled and CONF.profiler.trace_sqlalchemy:
++    osprofiler.sqlalchemy.add_tracing(sqlalchemy, db_engine, "db")
+     return db_engine
+ 
+ 
++def get_maker(engine, autocommit=True, expire_on_commit=False):
++    """Return a SQLAlchemy sessionmaker using the given engine."""
++    return sqlalchemy.orm.sessionmaker(bind=engine,
++                                       class_=Session,
++                                       autocommit=autocommit,
++                                       expire_on_commit=expire_on_commit,
++                                       query_cls=Query)
++
++
+ def get_session(autocommit=True, expire_on_commit=False):
+     """Helper method to grab session."""
+     global _MAKER, _ENGINE
+@@ -93,9 +288,9 @@ def get_session(autocommit=True, expire_on_commit=False):
+             msg = "***The Database has not been setup!!!***"
+             LOG.exception(msg)
+             raise RuntimeError(msg)
+-        _MAKER = sessionmaker(bind=_ENGINE,
+-                              autocommit=autocommit,
+-                              expire_on_commit=expire_on_commit)
++        _MAKER = get_maker(_ENGINE,
++                           autocommit=autocommit,
++                           expire_on_commit=expire_on_commit)
+     return _MAKER()
+ 
+ 
+diff --git a/trove/instance/models.py b/trove/instance/models.py
+index 322bfec..6321caa 100644
+--- a/trove/instance/models.py
++++ b/trove/instance/models.py
+@@ -665,7 +665,7 @@ class Instance(BuiltInstance):
+     @classmethod
+     def create(cls, context, name, flavor_id, image_id, databases, users,
+                datastore, datastore_version, volume_size, backup_id,
+-               availability_zone=None, nics=None, configuration_id=None,
++               availability_zone=None, nics=None, security_group=None, configuration_id=None,
+                slave_of_id=None, cluster_config=None, replica_count=None):
+ 
+         datastore_cfg = CONF.get(datastore_version.manager)
+@@ -777,8 +777,7 @@ class Instance(BuiltInstance):
+                 db_info = DBInstance.create(name=name, flavor_id=flavor_id,
+                                             tenant_id=context.tenant,
+                                             volume_size=volume_size,
+-                                            datastore_version_id=
+-                                            datastore_version.id,
++                                            datastore_version_id=datastore_version.id,
+                                             task_status=InstanceTasks.BUILDING,
+                                             configuration_id=configuration_id,
+                                             slave_of_id=slave_of_id,
+@@ -830,7 +829,7 @@ class Instance(BuiltInstance):
+                 instance_id, instance_name, flavor, image_id, databases, users,
+                 datastore_version.manager, datastore_version.packages,
+                 volume_size, backup_id, availability_zone, root_password,
+-                nics, overrides, slave_of_id, cluster_config)
++                nics, security_group, overrides, slave_of_id, cluster_config)
+ 
+             return SimpleInstance(context, db_info, service_status,
+                                   root_password)
+diff --git a/trove/instance/service.py b/trove/instance/service.py
+index e687365..f92f317 100644
+--- a/trove/instance/service.py
++++ b/trove/instance/service.py
+@@ -207,6 +207,7 @@ class InstanceController(wsgi.Controller):
+         name = body['instance']['name']
+         flavor_ref = body['instance']['flavorRef']
+         flavor_id = utils.get_id_from_href(flavor_ref)
++	security_group = body['instance'].get('security_group')
+ 
+         configuration = self._configuration_parse(context, body)
+         databases = populate_validated_databases(
+@@ -241,7 +242,7 @@ class InstanceController(wsgi.Controller):
+                                           image_id, databases, users,
+                                           datastore, datastore_version,
+                                           volume_size, backup_id,
+-                                          availability_zone, nics,
++                                          availability_zone, nics, security_group,
+                                           configuration, slave_of_id,
+                                           replica_count=replica_count)
+ 
+diff --git a/trove/taskmanager/api.py b/trove/taskmanager/api.py
+index 8f072d5..81f05f3 100644
+--- a/trove/taskmanager/api.py
++++ b/trove/taskmanager/api.py
+@@ -150,7 +150,8 @@ class API(object):
+                         image_id, databases, users, datastore_manager,
+                         packages, volume_size, backup_id=None,
+                         availability_zone=None, root_password=None,
+-                        nics=None, overrides=None, slave_of_id=None,
++                        nics=None, security_group=None,
++                        overrides=None, slave_of_id=None,
+                         cluster_config=None):
+ 
+         LOG.debug("Making async call to create instance %s " % instance_id)
+@@ -169,6 +170,7 @@ class API(object):
+                    availability_zone=availability_zone,
+                    root_password=root_password,
+                    nics=nics,
++                   security_group=security_group,
+                    overrides=overrides,
+                    slave_of_id=slave_of_id,
+                    cluster_config=cluster_config)
+diff --git a/trove/taskmanager/manager.py b/trove/taskmanager/manager.py
+index 242f9f7..19e7a11 100644
+--- a/trove/taskmanager/manager.py
++++ b/trove/taskmanager/manager.py
+@@ -256,7 +256,7 @@ class Manager(periodic_task.PeriodicTasks):
+                                   image_id, databases, users,
+                                   datastore_manager, packages, volume_size,
+                                   availability_zone, root_password, nics,
+-                                  overrides, slave_of_id, backup_id):
++                                  security_group, overrides, slave_of_id, backup_id):
+ 
+         if type(instance_id) in [list]:
+             ids = instance_id
+@@ -286,7 +286,7 @@ class Manager(periodic_task.PeriodicTasks):
+                         flavor, image_id, databases, users, datastore_manager,
+                         packages, volume_size, replica_backup_id,
+                         availability_zone, root_passwords[replica_index],
+-                        nics, overrides, None, snapshot)
++                        nics, security_group, overrides, None, snapshot)
+                     replicas.append(instance_tasks)
+                 except Exception:
+                     # if it's the first replica, then we shouldn't continue
+@@ -306,7 +306,7 @@ class Manager(periodic_task.PeriodicTasks):
+     def create_instance(self, context, instance_id, name, flavor,
+                         image_id, databases, users, datastore_manager,
+                         packages, volume_size, backup_id, availability_zone,
+-                        root_password, nics, overrides, slave_of_id,
++                        root_password, nics, security_group, overrides, slave_of_id,
+                         cluster_config):
+         if slave_of_id:
+             self._create_replication_slave(context, instance_id, name,
+@@ -314,7 +314,7 @@ class Manager(periodic_task.PeriodicTasks):
+                                            datastore_manager, packages,
+                                            volume_size,
+                                            availability_zone, root_password,
+-                                           nics, overrides, slave_of_id,
++                                           nics, security_group, overrides, slave_of_id,
+                                            backup_id)
+         else:
+             if type(instance_id) in [list]:
+@@ -325,7 +325,7 @@ class Manager(periodic_task.PeriodicTasks):
+                                            datastore_manager, packages,
+                                            volume_size, backup_id,
+                                            availability_zone, root_password,
+-                                           nics, overrides, cluster_config)
++                                           nics, security_group, overrides, cluster_config)
+             timeout = (CONF.restore_usage_timeout if backup_id
+                        else CONF.usage_timeout)
+             instance_tasks.wait_for_instance(timeout, flavor)
+diff --git a/trove/taskmanager/models.py b/trove/taskmanager/models.py
+index 03b20e6..384908f 100755
+--- a/trove/taskmanager/models.py
++++ b/trove/taskmanager/models.py
+@@ -266,13 +266,13 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
+     def create_instance(self, flavor, image_id, databases, users,
+                         datastore_manager, packages, volume_size,
+                         backup_id, availability_zone, root_password, nics,
+-                        overrides, cluster_config, snapshot=None):
++                        security_group, overrides, cluster_config, snapshot=None):
+         # It is the caller's responsibility to ensure that
+         # FreshInstanceTasks.wait_for_instance is called after
+         # create_instance to ensure that the proper usage event gets sent
+ 
+         LOG.info(_("Creating instance %s.") % self.id)
+-        security_groups = None
++        security_groups = []
+ 
+         # If security group support is enabled and heat based instance
+         # orchestration is disabled, create a security group.
+@@ -287,12 +287,12 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
+                        self.id)
+                 err = inst_models.InstanceTasks.BUILDING_ERROR_SEC_GROUP
+                 self._log_and_raise(e, msg, err)
+-            else:
+-                LOG.debug("Successfully created security group for "
+-                          "instance: %s" % self.id)
++	else:
++	    security_groups.append(security_group) if security_group else None
++	    LOG.debug("Successfully created security group for " "instance: %s" % self.id)
++	    LOG.debug("Security group name  %s" % security_groups)
+ 
+         files = self._get_injected_files(datastore_manager)
+-
+         if use_heat:
+             volume_info = self._create_server_volume_heat(
+                 flavor,
+@@ -304,7 +304,7 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
+                 files)
+         elif use_nova_server_volume:
+             volume_info = self._create_server_volume(
+-                flavor['id'],
++                flavor,
+                 image_id,
+                 security_groups,
+                 datastore_manager,
+@@ -314,7 +314,7 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
+                 files)
+         else:
+             volume_info = self._create_server_volume_individually(
+-                flavor['id'],
++                flavor,
+                 image_id,
+                 security_groups,
+                 datastore_manager,
+@@ -517,21 +517,33 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
+             raise TroveError(_("Server not active, status: %s") % nova_status)
+         return False
+ 
+-    def _create_server_volume(self, flavor_id, image_id, security_groups,
++    def _create_server_volume(self, flavor, image_id, security_groups,
+                               datastore_manager, volume_size,
+                               availability_zone, nics, files):
+         LOG.debug("Begin _create_server_volume for id: %s" % self.id)
+         try:
+-            userdata = self._prepare_userdata(datastore_manager)
+             name = self.hostname or self.name
+-            volume_desc = ("datastore volume for %s" % self.id)
+-            volume_name = ("datastore-%s" % self.id)
+-            volume_ref = {'size': volume_size, 'name': volume_name,
+-                          'description': volume_desc}
++            userdata = self._prepare_userdata(datastore_manager, name)
++            flavor_id = flavor['id']
++            disk_size = flavor['disk']
++            # volume_desc = ("datastore volume for %s" % self.id)
++            # volume_name = ("datastore-%s" % self.id)
++            # volume_ref = {'size': volume_size, 'name': volume_name,
++                          # 'description': volume_desc}
++            bdmap_v2 = []
++            block_device_first = { "boot_index": "0",
++                               "device_name": 'vda',
++                               "uuid": image_id,
++                               "source_type": "image",
++                               "volume_size": disk_size,
++                               "destination_type": "volume",
++                               "delete_on_termination": False }
++            bdmap_v2.append(block_device_first)
+             config_drive = CONF.use_nova_server_config_drive
+             server = self.nova_client.servers.create(
+                 name, image_id, flavor_id,
+-                files=files, volume=volume_ref,
++                # files=files, volume=volume_ref,
++                files=files, block_device_mapping_v2=bdmap_v2,
+                 security_groups=security_groups,
+                 availability_zone=availability_zone,
+                 nics=nics, config_drive=config_drive,
+@@ -557,8 +569,13 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
+ 
+         device_path = self.device_path
+         mount_point = CONF.get(datastore_manager).mount_point
+-        volume_info = {'device_path': device_path, 'mount_point': mount_point}
++        LOG.debug('XXXX volume_support is %s' % self.volume_support)
++        if self.volume_support:
++            volume_info = {'device_path': device_path, 'mount_point': mount_point}
++        else:
++            volume_info = {'device_path': None, 'mount_point': mount_point}
+         LOG.debug("End _create_server_volume for id: %s" % self.id)
++        LOG.debug("End volume info id: %s" % volume_info)
+         return volume_info
+ 
+     def _build_sg_rules_mapping(self, rule_ports):
+@@ -666,20 +683,32 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
+         LOG.debug("End _create_server_volume_heat for id: %s" % self.id)
+         return volume_info
+ 
+-    def _create_server_volume_individually(self, flavor_id, image_id,
++    def _create_server_volume_individually(self, flavor, image_id,
+                                            security_groups, datastore_manager,
+                                            volume_size, availability_zone,
+                                            nics, files):
+         LOG.debug("Begin _create_server_volume_individually for id: %s" %
+                   self.id)
+         server = None
++        flavor_id = flavor['id']
++        disk_size = flavor['disk']
+         volume_info = self._build_volume_info(datastore_manager,
+                                               volume_size=volume_size)
+         block_device_mapping = volume_info['block_device']
++        block_device_mapping_v2 = []
++        block_device_first = { "boot_index": "0",
++                               "device_name": 'vda',
++                               "uuid": image_id,
++                               "source_type": "image",
++                               "volume_size": disk_size,
++                               "destination_type": "volume",
++                               "delete_on_termination": False }
++        block_device_mapping_v2.append(block_device_first)
+         try:
+             server = self._create_server(flavor_id, image_id, security_groups,
+                                          datastore_manager,
+                                          block_device_mapping,
++                                         block_device_mapping_v2,
+                                          availability_zone, nics, files)
+             server_id = server.id
+             # Save server ID.
+@@ -771,26 +800,36 @@ class FreshInstanceTasks(FreshInstance, NotifyMixin, ConfigurationMixin):
+                        'volumes': created_volumes}
+         return volume_info
+ 
+-    def _prepare_userdata(self, datastore_manager):
++    def _prepare_userdata(self, datastore_manager, name):
+         userdata = None
+         cloudinit = os.path.join(CONF.get('cloudinit_location'),
+                                  "%s.cloudinit" % datastore_manager)
++        LOG.debug('XXXXXXXX Cloudinit Path: %s' % cloudinit)
+         if os.path.isfile(cloudinit):
+             with open(cloudinit, "r") as f:
+                 userdata = f.read()
+-        return userdata
++        LOG.debug('XXXXXXuserdata %s' % userdata)
++        return userdata % ({'datastore_manager': datastore_manager,
++                            'hostname': name, 'guest_id': self.id,
++                            'tenant_id': self.tenant_id})
+ 
+     def _create_server(self, flavor_id, image_id, security_groups,
+                        datastore_manager, block_device_mapping,
++                       block_device_mapping_v2,
+                        availability_zone, nics, files={}):
+-        userdata = self._prepare_userdata(datastore_manager)
+         name = self.hostname or self.name
++        userdata = self._prepare_userdata(datastore_manager, name)
+         bdmap = block_device_mapping
++        bdmap_v2 = block_device_mapping_v2
+         config_drive = CONF.use_nova_server_config_drive
++        LOG.debug('XXXXXXXXXXX: files: %s' % files)
++        LOG.debug('XXXXXXXXXXX: nics: %s' % nics)
++        LOG.debug('XXXXXXXXXXX: files: %s' % userdata)
+ 
+         server = self.nova_client.servers.create(
+             name, image_id, flavor_id, files=files, userdata=userdata,
+-            security_groups=security_groups, block_device_mapping=bdmap,
++            security_groups=security_groups, block_device_mapping=None,
++            block_device_mapping_v2=bdmap_v2,
+             availability_zone=availability_zone, nics=nics,
+             config_drive=config_drive)
+         LOG.debug("Created new compute instance %(server_id)s "
